@@ -10,7 +10,7 @@ This repository makes use of a starter-code set-up for the real-time Anomaly Seg
 
 
 
-##The code is able to reproduce the following results:
+## The code is able to reproduce the following results:
 
 * evaluation of pixel-based architecture (ERFNet): [**evalAnomalyERFNet.py**](https://github.com/Fakhreddine25/Anomaly-Segmentation/blob/main/eval/evalAnomalyERFNet.py)
 * evaluation of mask-based architecture (EoMT): [**evalAnomalyEoMT.py**](https://github.com/Fakhreddine25/Anomaly-Segmentation/blob/main/eval/evalAnomalyEoMT.py)
@@ -50,6 +50,7 @@ Additional arguments (optional):
 --save\_logits: If used, saves the logits of the outputs in the case of "MSP"
 --tempScale: Decides the value of temperature in order to perform Temperature Scaling, used with "MSP-T"
 --logits\_dir: This is the directory to save the logits in or could be used to load previously saved logits.
+
 
 
 
