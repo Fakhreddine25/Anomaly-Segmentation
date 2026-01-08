@@ -41,15 +41,23 @@ This code evaluates the ERFNet over our desired datasets. It is able to produce 
 ```
 
 
-Arguments: 
+**Arguments:** 
 - --input: Path to the first image within the chosen dataset with the image name indicated by '*' + .png (or the specific image extension)
 - --method: A str that indicates the post-hoc method to be used. Options are: [MSP, MaxL, MaxE, MSP-T]
 - --datadir: Path to the chosen dataset's folder which should include two folders: Images and Labels Masks
 
-Additional arguments (optional):\n
+**Additional arguments (optional):**
 - --save\_logits: If used, saves the logits of the outputs in the case of "MSP".
 - --tempScale: Decides the value of temperature in order to perform Temperature Scaling, used with "MSP-T".
 - --logits\_dir: This is the directory to save the logits in or could be used to load previously saved logits.
+
+**Example of complete command:**
+```
+!python eval/evalAnomalyERFNet.py --input "path/to/dataset/images/*.png" --method "MSP" --datadir "path/to/the/dataset/folder" --save_logits --tempScale 1.1 --logits_dir "path/to/save/or/load/logits/in"
+```
+
+
+
 
 
 
