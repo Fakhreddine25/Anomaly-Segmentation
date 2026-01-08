@@ -27,7 +27,16 @@ The evalAnomaly.py code was originally designed for an ERFNet model pre-trained 
 
 The reason that several codes are needed for different evaluations is that different approaches require different code adaptation in order to produce their evaluation over our dataset benchmark (SMIYC - FS - RA).
 
+## Requirements: 
 
+You must download the following:
+```
+!pip3 install timm transformers
+```
+```
+!pip3 install omegaconf
+```
+Downloading them is essential for the proper functioning of all the EoMT codes.
 
 ## evalAnomalyERFNet.py
 
@@ -83,6 +92,7 @@ This code evaluates the EoMT over our desired datasets. It is able to produce th
 ```
 
 ## eval_iouERFNet.py
+
 
 
 
