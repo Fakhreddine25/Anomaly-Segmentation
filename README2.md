@@ -36,9 +36,9 @@ The reason that several codes are needed for different evaluations is that diffe
 This code evaluates the ERFNet over our desired datasets. It is able to produce the following metrics: AuPRC - FPR@95 - mIoU. The code takes several arguments as inputs in order to function properly as intended.
 
 **Examples:**
-
+```
 !python eval/evalAnomalyERFNet.py --input path/to/dataset/images/\*.png --method "posthoc/method" --datadir path/to/the/dataset/folder 
-
+```
 
 
 Additional inputs that can be utilized: 
@@ -50,6 +50,7 @@ Additional inputs that can be utilized:
 --tempScale: Decides the value of temperature in order to perform Temperature Scaling, used with "MSP-T"
 
 --logits\_dir: This is the directory to save the logits in or could be used to load previously saved logits.
+
 
 
 
