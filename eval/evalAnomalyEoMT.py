@@ -5,141 +5,134 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 EOMT_ROOT = os.path.join(PROJECT_ROOT, "eomt")
 if EOMT_ROOT not in sys.path:
     sys.path.insert(0, EOMT_ROOT)
+
+print(f"Project Root: {PROJECT_ROOT}")
+print(f"Added to Path: {EOMT_ROOT}")
+
 import glob
 import torch
-import torch.nn.functional as F
+import math
 import random
-from PIL import Image
-import numpy as np
-from omegaconf import OmegaConf
 import importlib
-from typing import Any
-from argparse import ArgumentParser
-from ood_metrics import fpr_at_95_tpr
-from sklearn.metrics import average_precision_score
-from torchvision.transforms import Compose, Resize, ToTensor
+import argparse
+import numpy as np
 import matplotlib.pyplot as plt
-from collections import Counter
+import matplotlib.cm as cm
+from PIL import Image
+from omegaconf import OmegaConf
+from argparse import ArgumentParser
+from huggingface_hub import hf_hub_download
+from huggingface_hub.utils import RepositoryNotFoundError
+from torch.nn import functional as F
+from torchvision.transforms import Compose, Resize, ToTensor
+
+try:
+    from ood_metrics import calc_metrics, fpr_at_95_tpr
+    from sklearn.metrics import average_precision_score
+except ImportError:
+    print("Warning: ood_metrics.py not found. Metrics will be skipped")
+
 
 seed = 42
-
 random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
-
-NUM_CHANNELS = 3
-NUM_CLASSES = 20
-
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = True
 
 
-target_transform = Compose(
-    [
-        Resize((512, 1024), Image.NEAREST),
-    ]
-)
+# DATASET Configurations
+# Defines folders structures and data extension for each dataset, as well as its original size.
+DATASET_CONFIGS = {
+    "RoadAnomaly21": {
+        "img_folder": "images",
+        "target_folder": "labels_masks",
+        "suffix": ".png",
+        "eval_resize": None,
+    },
+    "RoadObsticle21": {
+        "img_folder": "images",
+        "target_folder": "labels_masks",
+        "suffix": ".webp",
+        "eval_resize": None,
+    },
+    "fs_static": {
+        "img_folder": "images",
+        "target_folder": "labels_masks",
+        "suffix": ".jpg",
+        "eval_resize": (1024, 2048),
+    },
+    "FS_LostFound_full": {
+        "img_folder": "images",
+        "target_folder": "labels_masks",
+        "suffix": ".png",
+        "eval_resize": (1024, 2048),
+    },
+    "RoadAnomaly": {
+        "img_folder": "images",
+        "target_folder": "labels_masks",
+        "suffix": ".jpg",
+        "eval_resize": None,
+    },
+}
 
 
-def visualize_result(
-    original_image_path, gt_mask, anomaly_score_map, output_filepath, method
-):
+def resize_pos_embed_rectangular(pos_embed, target_hw):
 
-    try:
-        orig_img = Image.open(original_image_path).convert("RGB")
-        orig_img = orig_img.resize((1024, 512), Image.BILINEAR)
-        orig_img = np.array(orig_img)
+    # Resizes ViT positional embeddings to match the image target resolution.
 
-        plt.figure(figsize=(15, 5))
-
-        plt.subplot(1, 3, 1)
-        plt.imshow(orig_img)
-        plt.title("Original Image")
-        plt.axis("off")
-
-        plt.subplot(1, 3, 2)
-        plt.imshow(gt_mask, cmap="binary")
-        plt.title("Ground Truth Anomaly")
-        plt.axis("off")
-
-        plt.subplot(1, 3, 3)
-        score_min = np.min(anomaly_score_map)
-        score_max = np.max(anomaly_score_map)
-
-        if "MSP" in method:
-            score_min, score_max = 0, 1
-            img = plt.imshow(
-                anomaly_score_map, cmap="magma", vmin=score_min, vmax=score_max
-            )
-        else:
-            img = plt.imshow(
-                anomaly_score_map,
-                cmap="magma",
-                vmin=score_min,
-                vmax=score_max,
-            )
-        plt.title(f"Score")
-        plt.axis("off")
-        plt.colorbar(img, fraction=0.046, pad=0.04)
-
-        plt.tight_layout()
-        plt.savefig(output_filepath)
-        plt.close()
-
-    except Exception as e:
-        print(f"Error during visualization of {output_filepath}: e")
-
-
-def resize_pos_embed_patch_only(
-    pos_embed: torch.Tensor, new_tokens: int
-) -> torch.Tensor:
-    """
-    pos_embed is patch-only: [1, N, C] with N = H*W (no cls/reg tokens inside).
-    Resizes from sqrt(N) x sqrt(N) -> sqrt(new_tokens) x sqrt(new_tokens).
-    """
     assert (
         pos_embed.dim() == 3 and pos_embed.size(0) == 1
     ), f"Unexpected pos_embed shape: {pos_embed.shape}"
     _, old_n, c = pos_embed.shape
+    target_h, target_w = target_hw
 
-    old_hw = int(old_n**0.5)
-    new_hw = int(new_tokens**0.5)
+    old_hw = int(math.sqrt(old_n))
 
-    if old_hw * old_hw != old_n or new_hw * new_hw != new_tokens:
-        raise ValueError(
-            f"pos_embed tokens not perfect squares: old={old_n}, new={new_tokens}"
+    if old_hw * old_hw != old_n:
+
+        print(
+            f"Warning: Source PosEmbed not square ({old_n}). Using linear interpolation."
         )
 
-    x = pos_embed.reshape(1, old_hw, old_hw, c).permute(0, 3, 1, 2)  # [1,C,H,W]
-    x = F.interpolate(x, size=(new_hw, new_hw), mode="bilinear", align_corners=False)
-    x = x.permute(0, 2, 3, 1).reshape(1, new_hw * new_hw, c)  # [1,newN,C]
+        x = pos_embed.tanspose(1, 2)
+        x = F.interpolate(
+            x, size=target_h * target_w, mode="linear", align_corners=False
+        )
+        return x.transpose(1, 2)
+
+    # Reshape to 2D grid -> Interpolate -> Flatten
+    x = pos_embed.reshape(1, old_hw, old_hw, c).permute(0, 3, 1, 2)
+
+    x = F.interpolate(x, size=(target_h, target_w), mode="bicubic", align_corners=False)
+
+    x = x.permute(0, 2, 3, 1).reshape(1, target_h * target_w, c)
     return x
 
 
-def inject_num_classes_into_eomt(node: Any, num_classes_value: int) -> None:
+def inject_config_args(node, key, value):
+
     if isinstance(node, dict):
-        class_path = node.get("class_path", "")
-        if class_path.split(".")[-1] == "EoMT":
-            init_args = node.get("init_args", None)
-            if not isinstance(init_args, dict):
-                init_args = {}
+        if "class_path" in node:
+            cls_name = node["class_path"].split(".")[-1]
+            if (key == "num_classes" and cls_name == "EoMT") or (
+                key == "img_size" and cls_name == "ViT"
+            ):
+                init_args = node.get("init_args", {})
+                if init_args is None:
+                    init_args = {}
+                init_args[key] = value
                 node["init_args"] = init_args
-
-            init_args.setdefault("num_classes", int(num_classes_value))
-
         for v in node.values():
-            inject_num_classes_into_eomt(v, num_classes_value)
-
+            inject_config_args(v, key, value)
     elif isinstance(node, list):
         for v in node:
-            inject_num_classes_into_eomt(v, num_classes_value)
+            inject_config_args(v, key, value)
 
 
-def instantiate_from_cfg(node: Any) -> Any:
-    """
-    Recursively instantiate objects from LightningCLI-style dicts:
-      {"class_path": "...", "init_args": {...}}
-    """
+def instantiate_from_cfg(node):
+
+    # Instantiates a Python object from a config dict.
     if isinstance(node, dict) and "class_path" in node:
         class_path = node["class_path"]
         init_args = node.get("init_args", {}) or {}
@@ -156,482 +149,444 @@ def instantiate_from_cfg(node: Any) -> Any:
     return node
 
 
-def inject_img_size_into_vit(node: Any, img_size_value: Any) -> None:
-    if isinstance(node, dict):
-        class_path = node.get("class_path", "")
-        if class_path.split(".")[-1] == "ViT":
-            init_args = node.get("init_args", None)
-            if not isinstance(init_args, dict):
-                init_args = {}
-                node["init_args"] = init_args
+def load_eomt_model(
+    config_path, checkpoint_path, device, img_size_tuple, num_classes=19
+):
 
-            init_args.setdefault("img_size", img_size_value)
+    # Loads the EoMT model from YAML and weights from eomt_checkpoints. If no local weights found it can download them using Hugging Face.
+    print(f"Loading configuration from {config_path}...")
+    cfg = OmegaConf.load(config_path)
 
-        for v in node.values():
-            inject_img_size_into_vit(v, img_size_value)
+    net_cfg = OmegaConf.to_container(cfg["model"]["init_args"]["network"], resolve=True)
+    inject_config_args(net_cfg, "img_size", img_size_tuple)
+    inject_config_args(net_cfg, "num_classes", num_classes)
 
-    elif isinstance(node, list):
-        for v in node:
-            inject_img_size_into_vit(v, img_size_value)
+    print(f"Building EoMT network for resolution {img_size_tuple}...")
+    model = instantiate_from_cfg(net_cfg)
+
+    # Determine weights source.
+    state_dict_path = None
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        print(f"Using local checkpoint: {checkpoint_path}")
+        state_dict_path = checkpoint_path
+
+    else:
+        name = cfg.get("trainer", {}).get("logger", {}).get("init_args", {}).get("name")
+        if name:
+            try:
+                state_dict_path = hf_hub_download(
+                    repo_id=f"tue-mps/{name}", filename="pytorch_model.bin"
+                )
+            except RepositoryNotFoundError:
+                print(f"Warning: No HF weights found for {name}")
+
+    # Loads weights if found
+    if state_dict_path:
+
+        print("Loading state dict...")
+        ckpt = torch.load(state_dict_path, map_location="cpu", weights_only=True)
+        state = ckpt.get("state_dict", ckpt)
+
+        clean_state = {}
+        for k, v in state.items():
+            k_new = k
+            for prefix in ["mdoel.network", "network.", "model.", "module."]:
+                if k_new.startswith(prefix):
+                    k_new = k_new[len(prefix) :]
+                    break
+            clean_state[k_new] = v
+
+        # Resolve mismatch in Positional Embeddings.
+        pe_key = "encoder.backbone.pos_embed"
+        if pe_key in clean_state:
+            model_sd = model.state_dict()
+            if pe_key in model_sd:
+                ckpt_shape = clean_state[pe_key].shape
+                model_shape = model_sd[pe_key].shape
+
+                if ckpt_shape != model_shape:
+                    print(
+                        f"Resizing pos_embed: ckpt {ckpt_shape} -> model {model_shape}"
+                    )
+
+                    try:
+                        patch_size = model.encoder.backbone.patch_embed.patch_size
+                        if isinstance(patch_size, int):
+                            patch_size = (patch_size, patch_size)
+                    except AttributeError:
+                        print(
+                            "Warning: Could not infer patch_size from model. Assuming 16."
+                        )
+                        patch_size = (16, 16)
+
+                    target_h_grid = img_size_tuple[0] // patch_size[0]
+                    target_w_grid = img_size_tuple[1] // patch_size[1]
+
+                    if target_h_grid * target_w_grid != model_shape[1]:
+
+                        print(
+                            f"Warning: Calculated grid {target_h_grid}x{target_w_grid} != model tokens {model_shape[1]}."
+                        )
+                        pass
+
+                    clean_state[pe_key] = resize_pos_embed_rectangular(
+                        clean_state[pe_key], (target_h_grid, target_w_grid)
+                    )
+
+        missing, unexpected = model.load_state_dict(clean_state, strict=False)
+        print(f"Weights Loaded. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+
+    else:
+        print("WARNING: Random initialization used!")
+
+    model.to(device)
+    model.eval()
+    return model
+
+
+def semantic_inference(model, image_tensor):
+
+    with torch.no_grad():
+        outputs = model(image_tensor)
+
+    # Unwrap output if wrapped in list/tuple
+    if (
+        isinstance(outputs, (list, tuple))
+        and len(outputs) == 1
+        and isinstance(outputs[0], (list, tuple))
+    ):
+
+        outputs = outputs[0]
+
+    if not isinstance(outputs, (list, tuple)) or len(outputs) != 2:
+        if hasattr(model, "network"):
+            outputs = model.network(image_tensor)
+        else:
+            raise ValueError(f"Unexpected model output format: {type(outputs)}")
+
+    mask_logits_list, class_logits_list = outputs
+    mask_logits = mask_logits_list[-1]
+    class_logits = class_logits_list[-1]
+
+    return mask_logits, class_logits
+
+
+def visualize_result(
+    original_image_path, gt_mask, anomaly_score_map, output_filepath, metohd, resize_dim
+):
+    try:
+        orig_img = Image.open(original_image_path).convert("RGB")
+        orig_img = orig_img.resize((resize_dim[1], resize_dim[0]), Image.BILINEAR)
+        orig_img = np.array(orig_img)
+
+        plt.figure(figsize=(15, 5))
+
+        # Original Image
+        plt.subplot(1, 3, 1)
+        plt.imshow(orig_img)
+        plt.title("Original Image")
+        plt.axis("off")
+
+        # Ground Truth Image
+        plt.subplot(1, 3, 2)
+        if gt_mask is not None:
+            gt_mask = np.where(gt_mask == 255, 0, gt_mask)
+            plt.imshow(gt_mask, cmap=cm.get_cmap("binary").reversed())
+        plt.title("Ground Truth")
+        plt.axis("off")
+
+        # Predictions
+        plt.subplot(1, 3, 3)
+        score_min, score_max = anomaly_score_map.min(), anomaly_score_map.max()
+        if metohd in ["MSP", "RbA", "MSP-T"]:
+            score_max, score_min = 1, 0
+
+        img = plt.imshow(
+            anomaly_score_map, cmap="magma", vmin=score_min, vmax=score_max
+        )
+        plt.title(f"Score: {metohd}")
+        plt.axis("off")
+        plt.colorbar(img, fraction=0.046, pad=0.04)
+
+        plt.tight_layout()
+        plt.savefig(output_filepath)
+        plt.close()
+
+    except Exception as e:
+        print(f"Error visualizing {output_filepath}: {e}")
 
 
 def main():
     parser = ArgumentParser()
+    parser.add_argument("--input", required=True, help="Root directory.")
     parser.add_argument(
-        "--input",
-        default=[
-            "D:/DAAI project/MaskArchitectureAnomaly_CourseProject-main/MaskArchitectureAnomaly_CourseProject-main/Validation_Dataset/Validation_Dataset/RoadAnomaly21/images/*.png"
-        ],
-        nargs="+",
-        help="A list of space separated input images; "
-        "or a single glob pattern such as 'directory/*.jpg'",
+        "--dataset", default="RoadAnomaly21", choices=DATASET_CONFIGS.keys()
     )
-
+    parser.add_argument("--config", default="eomt_base_640.yaml")
+    parser.add_argument("--ckpt", default=None)
+    parser.add_argument("--save", action="store_true")
+    parser.add_argument("--saveDir", default="./results")
+    parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--img_height", type=int, default=640)
+    parser.add_argument("--img_width", type=int, default=1280)
     parser.add_argument(
         "--method",
-        type=str,
         default="MSP",
-        choices=["MSP", "MaxL", "MaxE", "RbA", "MSP-T"],
-        help="Anomaly scoring method (MSP, MaxL, MaxE, RbA, MSP-T)",
-    )  # Method argument to decide the post-hoc method
-
-    parser.add_argument(
-        "--loadDir",
-        default=r"C:\Users\karee\Desktop\Anomaly-Project\MaskArchitectureAnomaly_CourseProject",
+        choices=["MSP", "MSP-T", "MaxLogit", "MaxEntropy", "RbA"],
     )
+    parser.add_argument("--tempScale", type=float, default=1.0)
 
-    parser.add_argument(
-        "--eomt_config",
-        default="eomt/configs/dinov2/cityscapes/semantic/eomt_base_640.yaml",
-    )  # Relative path to config file
-
-    parser.add_argument(
-        "--eomt_ckpt", default="eomt_checkpoints/eomt_cityscapes.bin"
-    )  # Relative path to pretrained model
-
-    parser.add_argument(
-        "--eomt_variant", default="base"
-    )  # optional label for you (base/large)
-    parser.add_argument(
-        "--subset", default="val"
-    )  # can be val or train (must have labels)
-    parser.add_argument(
-        "--datadir",
-        default=r"C:\Users\karee\Desktop\Anomaly-Project\MaskArchitectureAnomaly_CourseProject\Validation_Dataset\RoadAnomaly21",
-    )
-
-    parser.add_argument(
-        "--save_logits",
-        action="store_true",
-        help="If set, saves the raw logits for each image",
-    )
-
-    parser.add_argument(
-        "--logits_dir",
-        default="logits",
-    )  # Saved logits directory
-
-    parser.add_argument(
-        "--tempScale",
-        type=float,
-        default=1.0,
-        help="Temperature scaling factor for softmax (only for MSP-T method)",
-    )  # Temperature scale argument to decide post-processing in MSP-T
-
-    parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
-    anomaly_score_list = []
-    ood_gts_list = []
-
-    VIS_OUTPUT_DIR = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "vis_eomt", args.method
-    )
-    os.makedirs(VIS_OUTPUT_DIR, exist_ok=True)
-    print(f"Visualization results will be saved to: {VIS_OUTPUT_DIR}")
-
-    if not os.path.isabs(args.eomt_config):
-        args.eomt_config = os.path.normpath(
-            os.path.join(PROJECT_ROOT, args.eomt_config)
-        )
-
-    if not os.path.isabs(args.eomt_ckpt):
-        args.eomt_ckpt = os.path.normpath(os.path.join(PROJECT_ROOT, args.eomt_ckpt))
-
-    print("Resolved config:", args.eomt_config)
-    print("Resolved ckpt:", args.eomt_ckpt)
-    print("Config exists?", os.path.exists(args.eomt_config))
-    print("Ckpt exists?", os.path.exists(args.eomt_ckpt))
-
-    if not os.path.exists("results.txt"):
-        open("results.txt", "w").close()
-    file = open("results.txt", "a")
-
     device = torch.device("cpu" if args.cpu else "cuda")
+    ds_cfg = DATASET_CONFIGS[args.dataset]
+    image_dir = os.path.join(args.input, ds_cfg["img_folder"])
+    if (
+        not os.path.exists(image_dir)
+        and os.path.basename(os.path.normpath(args.input)) == ds_cfg["img_folder"]
+    ):
+        image_dir = args.input
+        args.input = os.path.dirname(args.input)
 
-    print("Loading EoMT config:", args.eomt_config)
-    print("Loading EoMT ckpt:", args.eomt_ckpt)
+    print(f"Scanning images in: {image_dir}")
+    images = sorted(
+        glob.glob(os.path.join(image_dir, "**", f"*{ds_cfg['suffix']}"), recursive=True)
+    )
+    if not images:
+        images = sorted(
+            glob.glob(os.path.join(image_dir, "**", "*.png"), recursive=True)
+        )
+    print(f"Found {len(images)} images.")
 
-    cfg = OmegaConf.load(args.eomt_config)
-
-    # --- get img_size + num_classes ---
-    data_args = cfg.get("data", {}).get("init_args", {})
-    img_size = data_args.get("img_size", 640)
-    num_classes = data_args.get("num_classes", 19)
-
-    # If yaml doesn't provide img_size correctly, infer from filename
-    if img_size is None:
-        if "1024" in os.path.basename(args.eomt_config):
-            img_size = 1024
-        elif "640" in os.path.basename(args.eomt_config):
-            img_size = 640
-        else:
-            img_size = 640  # safe default
-
-    # Normalize img_size to tuple for ViT
-    if isinstance(img_size, int):
-        img_size_vit = (img_size, img_size)
-    elif isinstance(img_size, (list, tuple)) and len(img_size) == 2:
-        img_size_vit = tuple(img_size)
-    else:
-        img_size_vit = (640, 640)
-
-    if num_classes is None:
-        num_classes = 19  # Cityscapes semantic classes
-    EVAL_SIZE = (512, 1024)  # keep your evaluation size (GT size)
+    img_size_tuple = (args.img_height, args.img_width)
+    try:
+        model = load_eomt_model(args.config, args.ckpt, device, img_size_tuple)
+    except Exception as e:
+        print(f"Critical Error loading model: {e}")
+        return
 
     input_transform = Compose(
         [
-            Resize(
-                img_size_vit, Image.BILINEAR
-            ),  # <-- model input MUST match (640,640)
+            Resize(img_size_tuple, Image.BILINEAR),
             ToTensor(),
         ]
     )
 
-    target_transform = Compose(
-        [
-            Resize(EVAL_SIZE, Image.NEAREST),  # keep GT at 512x1024 (as before)
-        ]
-    )
+    if args.save:
+        os.makedirs(args.saveDir, exist_ok=True)
 
-    # --- build net_node from YAML ---
-    net_node = OmegaConf.to_container(
-        cfg["model"]["init_args"]["network"], resolve=True
-    )
-    inject_img_size_into_vit(net_node, img_size_vit)
-    inject_num_classes_into_eomt(net_node, num_classes)
+    anomaly_scores_list = []
+    ood_gts_list = []
 
-    # Instantiate model
-    model = instantiate_from_cfg(net_node)
-    # 3) Load checkpoint
-    ckpt = torch.load(args.eomt_ckpt, map_location="cpu", weights_only=True)
-    print("Checkpoint type:", type(ckpt))
+    # Evaluation Loop.
+    for i, path in enumerate(images):
+        if i % 10 == 0:
+            print(f"Processing {i}/{len(images)}: {os.path.basename(path)}")
 
-    state = None
+        try:
+            image = Image.open(path).convert("RGB")
 
-    if isinstance(ckpt, dict):
-        print("Checkpoint keys:", list(ckpt.keys())[:20])
-
-        # try common keys where weights are stored
-        for key in ["state_dict", "model", "model_state_dict", "net", "network"]:
-            if key in ckpt:
-                state = ckpt[key]
-                print("Using weights from key:", key)
-                break
-
-        # if none of those keys exist, maybe ckpt itself is the state_dict
-        if state is None:
-            state = ckpt
-            print("Using checkpoint dict directly as state_dict.")
-    else:
-        # ckpt is already a state_dict (rare but possible)
-        state = ckpt
-        print("Checkpoint is not a dict; using it directly as state_dict.")
-
-    if not isinstance(state, dict):
-        raise TypeError(f"Loaded weights are not a dict. Got: {type(state)}")
-
-    # 4) Clean common prefixes (Lightning / DataParallel)
-    def strip_prefix(k: str) -> str:
-        for p in ("model.network.", "network.", "model.", "module."):
-            if k.startswith(p):
-                return k[len(p) :]
-        return k
-
-    clean_state = {strip_prefix(k): v for k, v in state.items()}
-
-    # ---- FIX pos_embed mismatch by resizing checkpoint pos_embed to model size ----
-    model_sd = model.state_dict()
-    pe_key = "encoder.backbone.pos_embed"
-
-    if pe_key in clean_state and pe_key in model_sd:
-        if clean_state[pe_key].shape != model_sd[pe_key].shape:
-            print(
-                "pos_embed mismatch:",
-                "ckpt",
-                tuple(clean_state[pe_key].shape),
-                "model",
-                tuple(model_sd[pe_key].shape),
-            )
-
-            new_tokens = model_sd[pe_key].shape[1]
-            clean_state[pe_key] = resize_pos_embed_patch_only(
-                clean_state[pe_key], new_tokens
-            )
-
-            print("Resized pos_embed to", tuple(clean_state[pe_key].shape))
-    # ------------------------------------------------------------------------------
-
-    missing, unexpected = model.load_state_dict(clean_state, strict=False)
-    print("Loaded EoMT weights.")
-    print("Missing keys:", len(missing))
-    print("Unexpected keys:", len(unexpected))
-    model.to(device)
-    model.eval()
-
-    # --- Debug counters ---
-    total_imgs = 0
-    missing_gt = 0
-    skipped_no_ood = 0
-    used_imgs = 0
-
-    # optional: show only first N debug prints (avoid spam)
-    debug_pairs_to_print = 5
-    printed_pairs = 0
-    LOGITS_OUTPUT_DIR = os.path.join(args.loadDir, args.logits_dir)
-    if args.save_logits:
-        if args.method == "MSP":
-            os.makedirs(LOGITS_OUTPUT_DIR, exist_ok=True)
-            print(f"Logits will be saved to: {LOGITS_OUTPUT_DIR}")
-    for path in glob.glob(os.path.expanduser(str(args.input[0]))):
-        total_imgs += 1
-        base_filename = os.path.basename(path).split(".")[0]
-        logits_path = os.path.join(LOGITS_OUTPUT_DIR, f"{base_filename}.pt")
-        print(path)
-        images = (
-            input_transform(Image.open(path).convert("RGB"))
-            .unsqueeze(0)
-            .float()
-            .to(device)
-        )
-
-        with torch.no_grad():
-
-            # If MSP-T then load the saved logits to save time
-            if args.method == "MSP-T":
-                base_filename = os.path.basename(path).split(".")[0]
-
-                logit_file_path = os.path.join(
-                    args.logits_dir, f"{base_filename.strip()}.pt"
-                )
-
-                # Load dictionary
-                loaded_dict = torch.load(logit_file_path, map_location=device)
-                mask_logits = loaded_dict["mask_logits"].to(device)
-                class_logits = loaded_dict["class_logits"].to(device)
-
-            # Else, evaluate the model to get results
+            # Find eval size.
+            orig_w, orig_h = image.size
+            if ds_cfg.get("eval_resize"):
+                EVAL_H, EVAL_W = ds_cfg["eval_resize"]
             else:
-                mask_logits_layers, class_logits_layers = model(images)
-                mask_logits = mask_logits_layers[-1]
-                class_logits = class_logits_layers[-1]
+                EVAL_H, EVAL_W = orig_h, orig_w
 
-            # Save logits only in MSP case (not necessary but to avoid saving every single time on all methods)
-            if args.save_logits:
-                if args.method == "MSP":
-                    torch.save(
-                        {
-                            "mask_logits": mask_logits.cpu(),
-                            "class_logits": class_logits.cpu(),
-                        },
-                        logits_path,
-                    )
-                    print(f"Saved logits to: {logits_path}")
+            image_tensor = input_transform(image).unsqueeze(0).to(device)
 
-            # If MSP, normalize the class_logits by temperature scale
-            if args.method == "MSP-T":
-                t = (torch.ones(1) * args.tempScale).cuda()
-                class_probs_all = F.softmax(class_logits / t, dim=-1)[..., :-1]
+            # --- Inference ---
+
+            mask_logits, class_logits = semantic_inference(model, image_tensor)
+
+            # Method: Rejected by All (RbA)
+            if args.method == "RbA":
                 mask_probs = mask_logits.sigmoid()
+                class_probs_all = F.softmax(class_logits, dim=-1)
 
-            # Else, continue
-            else:
-                class_probs_all = F.softmax(class_logits, dim=-1)[..., :-1]
-                mask_probs = mask_logits.sigmoid()
+                inlier_probs = class_probs_all[..., :-1]
 
-            # Construct semantic map including the VOID channel
-            sem_probs_all = torch.einsum(
-                "bqk, bqhw -> bkhw", class_probs_all, mask_probs
-            )
+                # Rejection score.
+                rej_q = 1.0 - inlier_probs.max(dim=-1).values
 
-            # Normalize spatially across all class possibilities
-            sem_probs_all = sem_probs_all / (
-                sem_probs_all.sum(dim=1, keepdim=True) + 1e-6
-            )
+                # Rejection Map
+                rba_map = torch.einsum("bq,bqhw->bhw", rej_q, mask_probs)
 
-            # Resize to target resolution
-            sem_probs_all = F.interpolate(
-                sem_probs_all,
-                size=(512, 1024),
-                mode="bilinear",
-                align_corners=False,
-            )
+                rba_map = rba_map / (mask_probs.sum(dim=1))
 
-            # In-Distribution probs
-            sem_probs_id = sem_probs_all[:, :-1, :, :]
-
-            if args.method == "MSP-T":
-                anomaly_result = (
-                    (1.0 - sem_probs_id.max(dim=1).values).squeeze().cpu().numpy()
-                )
-            elif args.method == "RbA":
-                mask_probs = mask_logits.sigmoid()
-                class_probs_all = F.softmax(class_logits, dim=-1)  # [B, Q, C+1]
-                inlier_probs = class_probs_all[..., :-1]  # [B, Q, C]
-
-                rej_q = 1.0 - inlier_probs.max(dim=-1).values  # [B, Q]
-
-                # pixel score: queries' rejection weighted by their mask
-                rba_map = torch.einsum("bq,bqhw->bhw", rej_q, mask_probs)  # [B, Hm, Wm]
-
-                rba_map = rba_map / (mask_probs.sum(dim=1) + 1e-6)  # [B, Hm, Wm]
-
-                # resize to GT size (our eval size)
                 rba_map = F.interpolate(
                     rba_map.unsqueeze(1),
-                    size=(512, 1024),
+                    size=(EVAL_H, EVAL_W),
                     mode="bilinear",
                     align_corners=False,
                 ).squeeze(1)
-                anomaly_result = rba_map.squeeze(0).cpu().numpy()  # [H, W]
+                anomaly_map = rba_map.squeeze(0).cpu().numpy()
 
-            # Standard methods (MSP, MaxL, MaxE) work on in-distribution    channels
-            elif args.method == "MSP":
-                anomaly_result = (
-                    (1.0 - sem_probs_id.max(dim=1).values).squeeze().cpu().numpy()
-                )
-            elif args.method == "MaxL":
-                pixel_logits = torch.einsum(
-                    "bqk, bqhw -> bkhw", class_logits[:, :, :-1], mask_probs
-                )
+            # Methods: MSP - MaxLogit - MaxEntropy
+            else:
+                # Softmax probabilities for probability methods (not Logits)
+                if args.method != "MaxLogit":
 
-                pixel_logits = F.interpolate(
-                    pixel_logits,
-                    size=(512, 1024),
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                anomaly_result = (
-                    (-pixel_logits.max(dim=1).values).squeeze().cpu().numpy()
-                )
-            elif args.method == "MaxE":
-                # Shannon Entropy
-                anomaly_result = (
-                    (-(sem_probs_id * torch.log(sem_probs_id + 1e-12)).sum(dim=1))
-                    .squeeze()
-                    .cpu()
-                    .numpy()
-                )
+                    class_probs_all = F.softmax(class_logits, dim=-1)[..., :-1]
+                    mask_probs = mask_logits.sigmoid()
 
-        # --- Load GT ---
-        pathGT = path.replace("images", "labels_masks")
-        # Adapt for different image extensions
-        if "RoadObsticle21" in pathGT:
-            pathGT = pathGT.replace("webp", "png")
-        if "fs_static" in pathGT:
-            pathGT = pathGT.replace("jpg", "png")
-        if "RoadAnomaly" in pathGT:
-            pathGT = pathGT.replace("jpg", "png")
+                    sem_probs_id = torch.einsum(
+                        "bqk, bqhw -> bkhw", class_probs_all, mask_probs
+                    )
 
-            # --- Debug: verify GT path exists ---
-        if printed_pairs < debug_pairs_to_print:
-            print(f"\nIMG: {path}")
-            print(f"GT : {pathGT}")
-            print("GT exists?", os.path.exists(pathGT))
-            printed_pairs += 1
+                    # Normalize
+                    sem_probs_id = sem_probs_id / (
+                        sem_probs_id.sum(dim=1, keepdim=True)
+                    )
 
-        if not os.path.exists(pathGT):
-            missing_gt += 1
-            # print the missing ones (optional)
-            print("!! Missing GT file:", pathGT)
+                    sem_probs_id = F.interpolate(
+                        sem_probs_id,
+                        size=(EVAL_H, EVAL_W),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+
+                # Maximum Softmax Probability
+                if args.method == "MSP":
+                    anomaly_map = (
+                        (1.0 - sem_probs_id.max(dim=1).values).squeeze().cpu().numpy()
+                    )
+
+                # Maximum Entropy
+                elif args.method == "MaxEntropy":
+                    anomaly_map = (
+                        (-(sem_probs_id * torch.log(sem_probs_id)).sum(dim=1))
+                        .squeeze()
+                        .cpu()
+                        .numpy()
+                    )
+
+                # Maximum Logit with logits scoring not probabilities.
+                elif args.method == "MaxLogit":
+                    class_term = class_logits[..., :-1]
+                    mask_probs = mask_logits.sigmoid()
+
+                    sem_map = torch.einsum("bqk, bqhw -> bkhw", class_term, mask_probs)
+                    sem_map = F.interpolate(
+                        sem_map,
+                        size=(EVAL_H, EVAL_W),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    anomaly_map = (-sem_map.max(dim=1).values).squeeze().cpu().numpy()
+
+                # MSP with Temperature scaling.
+                # Requires redefinition of softmax probabilities with scaled class_logits
+                elif args.method == "MSP-T":
+                    t = (torch.ones(1) * args.tempScale).to(device)
+                    class_probs_all = F.softmax(class_logits / t, dim=-1)[..., :-1]
+                    mask_probs = mask_logits.sigmoid()
+                    sem_probs_id = torch.einsum(
+                        "bqk, bqhw -> bkhw", class_probs_all, mask_probs
+                    )
+
+                    sem_probs_id = sem_probs_id / (
+                        sem_probs_id.sum(dim=1, keepdim=True)
+                    )
+
+                    sem_probs_id = F.interpolate(
+                        sem_probs_id,
+                        size=(EVAL_H, EVAL_W),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    anomaly_map = (
+                        (1.0 - sem_probs_id.max(dim=1).values).squeeze().cpu().numpy()
+                    )
+
+        except Exception as e:
+            print(f"Error processing {path}: {e}")
             continue
 
-        mask = Image.open(pathGT)
-        mask = target_transform(mask)
-        ood_gts = np.array(mask)
-        if printed_pairs <= debug_pairs_to_print:
+        # --- GT Loading ---
+        filename = os.path.basename(path)
+        gt_path = os.path.join(args.input, ds_cfg["target_folder"], filename)
+        if not os.path.exists(gt_path):
+            gt_path = gt_path.replace(ds_cfg["suffix"], ".png")
+        if not os.path.exists(gt_path) and filename.endswith(".jpg"):
+            gt_path = gt_path.replace(".jpg", ".png")
 
-            u = np.unique(ood_gts)
-            print(
-                "Raw GT unique values (first few):",
-                u[:30],
-                "..." if len(u) > 30 else "",
-            )
+        if os.path.exists(gt_path):
+            gt_img = Image.open(gt_path)
+            if gt_img.size != (EVAL_W, EVAL_H):
+                gt_img = gt_img.resize((EVAL_W, EVAL_H), Image.NEAREST)
+            gt_np = np.array(gt_img)
 
-        # RA: Unique labels: [0, 1, 2]  --> Remap 2 to 1
-        # RA21, RO21, FS_LF, FS_Static: Unique labels: [0,1,255]  --> Remap 255 to 1
-        if "RoadAnomaly" in pathGT:
-            ood_gts = np.where((ood_gts == 2), 1, ood_gts)
-        if "RoadObsticle21" in pathGT or "RoadAnomaly21" in pathGT:
-            ood_gts = np.where((ood_gts == 255), 1, ood_gts)
-        if "FS_LostFound_full" in pathGT or "fs_static" in pathGT:
-            ood_gts = np.where((ood_gts == 255), 1, ood_gts)
+            # Map datasets to binary combinations.
+            if "RoadAnomaly" in args.dataset:
+                gt_np = np.where(gt_np == 2, 1, gt_np)
+            if "FS_LostFound_full" in args.dataset or "fs_static" in args.dataset:
+                gt_np = np.where(gt_np == 255, 1, gt_np)
 
-        if 1 not in np.unique(ood_gts):
-            skipped_no_ood += 1
-            continue
+            binary_gt = gt_np.astype(np.uint8)
+
+            # Skip images with no valid pixels
+            if 1 not in np.unique(binary_gt):
+                continue
+
+            if args.method in ["MaxLogit", "RbA", "MaxEntropy", "MSP", "MSP-T"]:
+                min_v, max_v = anomaly_map.min(), anomaly_map.max()
+                if max_v != min_v:
+                    anomaly_map = (anomaly_map - min_v) / (max_v - min_v)
+
+            ood_gts_list.append(binary_gt.flatten())
+            anomaly_scores_list.append(anomaly_map.flatten())
+
+            if args.save:
+                save_path = os.path.join(
+                    args.saveDir,
+                    filename.replace(ds_cfg["suffix"], f"_{args.method}.png"),
+                )
+                visualize_result(
+                    path,
+                    binary_gt,
+                    anomaly_map,
+                    save_path,
+                    args.method,
+                    (EVAL_H, EVAL_W),
+                )
         else:
-            used_imgs += 1
-            ood_gts_list.append(ood_gts)
-            anomaly_score_list.append(anomaly_result)
-            base_filename = os.path.basename(path).split(".")[0]
-            viz_filename = os.path.join(VIS_OUTPUT_DIR, f"{base_filename}.png")
+            if i == 0:
+                print(f"DEBUG: GT missing at {gt_path}")
 
-            visualize_result(
-                original_image_path=path,
-                gt_mask=ood_gts,
-                anomaly_score_map=anomaly_result,
-                output_filepath=viz_filename,
-                method=args.method,
+    # --- Metrics ---
+    if ood_gts_list:
+        print("\nCalculating Metrics...")
+        all_scores = np.concatenate(anomaly_scores_list)
+        all_gts = np.concatenate(ood_gts_list)
+
+        # RAM optimization
+        if len(all_gts) > 20_000_000:
+            print(
+                f"Dataset too large for RAM ({len(all_gts)} pixels). Subsampling 10%..."
             )
-            print(f"Saved visualization for {base_filename}")
-        del anomaly_result, ood_gts, mask
-        torch.cuda.empty_cache()
+            all_scores = all_scores[::10]
+            all_gts = all_gts[::10]
 
-    file.write("\n")
-    print("\n--- Dataset filtering summary ---")
-    print("Total images found:", total_imgs)
-    print("Missing GT files   :", missing_gt)
-    print("Skipped (no OOD=1)  :", skipped_no_ood)
-    print("Used for metrics    :", used_imgs)
+        valid_mask = all_gts != 255
+        all_scores = all_scores[valid_mask]
+        all_gts = all_gts[valid_mask]
 
-    ood_gts = np.array(ood_gts_list)
-    anomaly_scores = np.array(anomaly_score_list)
+        fpr = fpr_at_95_tpr(all_scores, all_gts)
 
-    ood_mask = ood_gts == 1
-    ind_mask = ood_gts == 0
+        fpr = fpr_at_95_tpr(all_scores, all_gts)
+        auprc = average_precision_score(all_gts, all_scores)
 
-    ood_out = anomaly_scores[ood_mask]
-    ind_out = anomaly_scores[ind_mask]
+        print(f"Method: {args.method}")
 
-    ood_label = np.ones(len(ood_out))
-    ind_label = np.zeros(len(ind_out))
+        print(f"AUPRC: {auprc * 100:.4f}")
+        print(f"FPR@95: {fpr * 100:.4f}")
 
-    val_out = np.concatenate((ind_out, ood_out))
-    val_label = np.concatenate((ind_label, ood_label))
-
-    prc_auc = average_precision_score(val_label, val_out)
-    fpr = fpr_at_95_tpr(val_out, val_label)
-
-    print(f"AUPRC score: {prc_auc*100.0}")
-    print(f"FPR@TPR95: {fpr*100.0}")
-
-    file.write(
-        ("    AUPRC score:" + str(prc_auc * 100.0) + "   FPR@TPR95:" + str(fpr * 100.0))
-    )
-    file.close()
+        with open("results.txt", "a") as f:
+            f.write(
+                f"\n{args.dataset} | {args.method}: AUPRC={auprc:.4f}, FPR={fpr:.4f}"
+            )
+    else:
+        print("No valid GT data found for metrics.")
 
 
 if __name__ == "__main__":
