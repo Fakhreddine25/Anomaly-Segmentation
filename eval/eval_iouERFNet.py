@@ -66,6 +66,10 @@ def get_anomaly_prediction(outputs, method, threshold, tempScale):
         raise ValueError(f"Unknown method: {method}")
 
     # Binarize
+    if method in ["MaxLogit", "RbA", "MaxEntropy"]:
+        min_v, max_v = score.min(), score.max()
+        if max_v != min_v:
+            score = (score - min_v) / (max_v - min_v)
     preds = (score > threshold).long()
 
     # Ensure 4D shape [B, 1, H, W] for the evaluator
@@ -125,7 +129,10 @@ def main(args):
     )
 
     # iouEval for evaluation of mIoU initialized for 2 classes: 0 (Normal) and 1 (Anomaly)
-    iouEvalVal = iouEval(NUM_CLASSES_IOU)
+    if "RoadAnomaly21" in args.datadir or "RoadObsticle21" in args.datadir:
+        iouEvalVal = iouEval(nClasses=3, ignoreIndex=2)
+    else:
+        iouEvalVal = iouEval(nClasses=2)
 
     start = time.time()
 
@@ -143,27 +150,29 @@ def main(args):
         )
 
         # Ground-Truth remapping
-        labels_np = labels.cpu().numpy()
+        gt_np = labels.cpu().numpy()
         pathGT = filenameGt[0]
 
         # RA: Unique labels: [0, 1, 2]  --> Remap 2 to 1
-        # RA21, RO21, FS_LF, FS_Static: Unique labels: [0,1,255]  --> Remap 255 to 1
+
         if "RoadAnomaly" in pathGT:
-            labels_binary = np.where((labels_np == 2), 1, 0)
-        elif "RoadObsticle21" in pathGT or "RoadAnomaly21" in pathGT:
-            labels_binary = np.where((labels_np == 255), 1, 0)
-        elif "FS_LostFound_full" in pathGT or "fs_static" in pathGT:
-            labels_binary = np.where((labels_np == 255), 1, 0)
+            gt_np = np.where(gt_np == 2, 1, gt_np)
+        if "FS_LostFound_full" in pathGT or "fs_static" in pathGT:
+            gt_np = np.where(gt_np == 255, 1, gt_np)
+        if "RoadAnomaly21" in pathGT or "RoadObsticle21" in pathGT:
+            gt_np = np.where(gt_np == 255, 2, gt_np)
+        binary_gt = gt_np.astype(np.uint8)
 
-        labels = torch.from_numpy(labels_binary).long()
-        if not args.cpu:
-            labels = labels.cuda()
+        pred_tensor = binary_predictions.long()
+        gt_tensor = torch.from_numpy(binary_gt).long()
+        iouEvalVal.addBatch(pred_tensor, gt_tensor)
 
-        # Ensure labels is also 4D [B, 1, H, W]
-        if labels.dim() == 3:
-            labels = labels.unsqueeze(1)
-
-        iouEvalVal.addBatch(binary_predictions, labels)
+        # if "RoadAnomaly" in pathGT:
+        #     labels_binary = np.where((labels_np == 2), 1, 0)
+        # if "FS_LostFound_full" in pathGT:
+        #     labels_binary = np.where((labels_np == 255), 1, 0)
+        # if "fs_static" in pathGT:
+        #     labels_binary = np.where((labels_np == 255), 1, 0)
 
         filenameSave = os.path.basename(filename[0])
         print(step, filenameSave)

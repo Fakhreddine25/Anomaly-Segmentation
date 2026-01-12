@@ -1,100 +1,117 @@
-# Code to calculate IoU (mean and per-class) in a dataset
-# Nov 2017
-# Eduardo Romera
-#######################
-
-# Code to calculate IoU (mean and per-class) for EoMT Anomaly Detection
-# Adapted for Mask Transformer architectures 2025
-#######################
 import os
 import sys
-
-current_script_path = os.path.abspath(__file__)
-eval_folder = os.path.dirname(current_script_path)
-project_root = os.path.abspath(os.path.join(eval_folder, ".."))
-eomt_folder = os.path.join(project_root, "eomt")
-
-for path in [project_root, eomt_folder]:
-    if path not in sys.path:
-        sys.path.insert(0, path)
-
-import numpy as np
-import torch
-import torch.nn.functional as F
-import importlib
-import time
 import glob
-from PIL import Image
+import torch
+import math
+import random
+import importlib
+import numpy as np
+import time
 from argparse import ArgumentParser
+from PIL import Image
 from omegaconf import OmegaConf
-from typing import Any
-from dataset import Anomaly
-
-from torch.utils.data import DataLoader
-from torchvision.transforms import Compose, Resize, ToTensor, ToPILImage
-
-# Project Modules
-try:
-    from ood_metrics import fpr_at_95_tpr
-except ImportError:
-    pass
+from torch.nn import functional as F
+from torchvision.transforms import Compose, Resize, ToTensor
+from huggingface_hub import hf_hub_download
+from huggingface_hub.utils import RepositoryNotFoundError
 
 try:
-    import models
+    from iouEval2 import iouEval, getColorEntry
 except ImportError:
-    print(f"\n[!] CRITICAL ERROR: Could not find the 'models' folder.")
-    print(f"Expected location: {os.path.join(eomt_folder, 'models')}")
-    print(f"Please ensure {eomt_folder} exists and contains a 'models' subfolder.")
+    print("Could not import iouEval2. Please ensure iouEval2.py is in the directory.")
     sys.exit(1)
 
-from transform import ToLabel
-from iouEval2 import iouEval, getColorEntry
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+EOMT_ROOT = os.path.join(PROJECT_ROOT, "eomt")
+if EOMT_ROOT not in sys.path:
+    sys.path.insert(0, EOMT_ROOT)
 
-# 20 classes for model evaluation
-# 2 classes for binary anomaly in IoU
-NUM_CLASSES_MODEL = 20
-NUM_CLASSES_IOU = 2
+seed = 42
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = True
 
-image_transform = ToPILImage()
-input_transform_anomaly = Compose(
-    [
-        Resize((512, 1024)),
-        ToTensor(),
-        # Normalize([.485, .456, .406], [.229, .224, .225]), # Uncomment if your weights require it
-    ]
-)
+# DATASET Configurations
+DATASET_CONFIGS = {
+    "RoadAnomaly21": {
+        "img_folder": "images",
+        "target_folder": "labels_masks",
+        "suffix": ".png",
+        "eval_resize": None,
+    },
+    "RoadObsticle21": {
+        "img_folder": "images",
+        "target_folder": "labels_masks",
+        "suffix": ".webp",
+        "eval_resize": None,
+    },
+    "fs_static": {
+        "img_folder": "images",
+        "target_folder": "labels_masks",
+        "suffix": ".jpg",
+        "eval_resize": (1024, 2048),
+    },
+    "FS_LostFound_full": {
+        "img_folder": "images",
+        "target_folder": "labels_masks",
+        "suffix": ".png",
+        "eval_resize": (1024, 2048),
+    },
+    "RoadAnomaly": {
+        "img_folder": "images",
+        "target_folder": "labels_masks",
+        "suffix": ".jpg",
+        "eval_resize": None,
+    },
+}
 
-# We use a base transform for initial loading; specific remapping is done in the loop
-target_transform_anomaly = Compose(
-    [
-        Resize((512, 1024), Image.NEAREST),
-        ToLabel(),
-    ]
-)
 
-
-def resize_pos_embed_path_only(
-    pos_embed: torch.Tensor, new_tokens: int
-) -> torch.Tensor:
+def resize_pos_embed_rectangular(pos_embed, target_hw):
     assert pos_embed.dim() == 3 and pos_embed.size(0) == 1
     _, old_n, c = pos_embed.shape
-    old_hw = int(old_n**0.5)
-    new_hw = int(new_tokens**0.5)
+    target_h, target_w = target_hw
+    old_hw = int(math.sqrt(old_n))
+
+    if old_hw * old_hw != old_n:
+        x = pos_embed.transpose(1, 2)
+        x = F.interpolate(
+            x, size=target_h * target_w, mode="linear", align_corners=False
+        )
+        return x.transpose(1, 2)
+
     x = pos_embed.reshape(1, old_hw, old_hw, c).permute(0, 3, 1, 2)
-    x = F.interpolate(x, size=(new_hw, new_hw), mode="bilinear", align_corners=False)
-    x = x.permute(0, 2, 3, 1).reshape(1, new_hw * new_hw, c)
+    x = F.interpolate(x, size=(target_h, target_w), mode="bicubic", align_corners=False)
+    x = x.permute(0, 2, 3, 1).reshape(1, target_h * target_w, c)
     return x
 
 
-def instantiate_from_cfg(node: Any) -> Any:
+def inject_config_args(node, key, value):
+    if isinstance(node, dict):
+        if "class_path" in node:
+            cls_name = node["class_path"].split(".")[-1]
+            if (key == "num_classes" and cls_name == "EoMT") or (
+                key == "img_size" and cls_name == "ViT"
+            ):
+                init_args = node.get("init_args", {})
+                if init_args is None:
+                    init_args = {}
+                init_args[key] = value
+                node["init_args"] = init_args
+        for v in node.values():
+            inject_config_args(v, key, value)
+    elif isinstance(node, list):
+        for v in node:
+            inject_config_args(v, key, value)
+
+
+def instantiate_from_cfg(node):
     if isinstance(node, dict) and "class_path" in node:
         class_path = node["class_path"]
         init_args = node.get("init_args", {}) or {}
         init_args = {k: instantiate_from_cfg(v) for k, v in init_args.items()}
-        (
-            module_name,
-            cls_name,
-        ) = class_path.rsplit(".", 1)
+        module_name, cls_name = class_path.rsplit(".", 1)
         cls = getattr(importlib.import_module(module_name), cls_name)
         return cls(**init_args)
     if isinstance(node, dict):
@@ -104,271 +121,335 @@ def instantiate_from_cfg(node: Any) -> Any:
     return node
 
 
-def inject_cfg_values(node: Any, img_size: tuple, num_classes: int) -> None:
-    if isinstance(node, dict):
-        cp = node.get("class_path", "")
-        if cp.endswith("ViT"):
-            node.setdefault("init_args", {})["img_size"] = img_size
-        if cp.endswith("EoMT"):
-            node.setdefault("init_args", {})["num_classes"] = num_classes
-        for v in node.values():
-            inject_cfg_values(v, img_size, num_classes)
-    elif isinstance(node, list):
-        for v in node:
-            inject_cfg_values(v, img_size, num_classes)
-
-
-def get_anomaly_prediction(
-    mask_logits, class_logits, method, threshold, tempScale, target_size=(512, 1024)
+def load_eomt_model(
+    config_path, checkpoint_path, device, img_size_tuple, num_classes=19
 ):
-    """
-    Calculates continuous anomaly scores for EoMT and binarizes based on threshold.
-    """
+    print(f"Loading configuration from {config_path}...")
+    cfg = OmegaConf.load(config_path)
+    net_cfg = OmegaConf.to_container(cfg["model"]["init_args"]["network"], resolve=True)
+    inject_config_args(net_cfg, "img_size", img_size_tuple)
+    inject_config_args(net_cfg, "num_classes", num_classes)
 
-    # If MSP, normalize the class_logits by temperature scale
-    if method == "MSP-T":
-        t = (torch.ones(1) * tempScale).cuda()
-        class_probs_all = F.softmax(class_logits / t, dim=-1)[..., :-1]
-        mask_probs = mask_logits.sigmoid()
+    print(f"Building EoMT Network for resolution {img_size_tuple}...")
+    model = instantiate_from_cfg(net_cfg)
 
-    # Else, continue
+    state_dict_path = None
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        print(f"Using local checkpoint: {checkpoint_path}")
+        state_dict_path = checkpoint_path
     else:
-        class_probs_all = F.softmax(class_logits, dim=-1)[..., :-1]
-        mask_probs = mask_logits.sigmoid()
+        name = cfg.get("trainer", {}).get("logger", {}).get("init_args", {}).get("name")
+        if name:
+            try:
+                state_dict_path = hf_hub_download(
+                    repo_id=f"tue-mps/{name}", filename="pytorch_model.bin"
+                )
+            except RepositoryNotFoundError:
+                print(f"Warning: No HF weights found for {name}")
 
-    # Construct semantic map including the VOID channel
-    sem_probs_all = torch.einsum("bqk, bqhw -> bkhw", class_probs_all, mask_probs)
-    # Normalize spatially across all class possibilities
-    sem_probs_all = sem_probs_all / (sem_probs_all.sum(dim=1, keepdim=True) + 1e-6)
-    # Resize to target resolution
-    sem_probs_all = F.interpolate(
-        sem_probs_all,
-        size=(512, 1024),
-        mode="bilinear",
-        align_corners=False,
-    )
-    # In-Distribution probs
-    sem_probs_id = sem_probs_all[:, :-1, :, :]
+    if state_dict_path:
+        print("Loading state dict...")
+        ckpt = torch.load(state_dict_path, map_location="cpu", weights_only=True)
+        state = ckpt.get("state_dict", ckpt)
+        clean_state = {}
+        for k, v in state.items():
+            k_new = k
+            for prefix in ["model.network.", "network.", "model.", "module."]:
+                if k_new.startswith(prefix):
+                    k_new = k_new[len(prefix) :]
+                    break
+            clean_state[k_new] = v
 
-    if method == "MSP-T":
-        anomaly_result = (1.0 - sem_probs_id.max(dim=1).values).squeeze().cpu()
-    elif method == "RbA":
-        mask_probs = mask_logits.sigmoid()
-        class_probs_all = F.softmax(class_logits, dim=-1)  # [B, Q, C+1]
-        inlier_probs = class_probs_all[..., :-1]  # [B, Q, C]
-        rej_q = 1.0 - inlier_probs.max(dim=-1).values  # [B, Q]
-        # pixel score: queries' rejection weighted by their mask
-        rba_map = torch.einsum("bq,bqhw->bhw", rej_q, mask_probs)  # [B, Hm, Wm]
-        rba_map = rba_map / (mask_probs.sum(dim=1) + 1e-6)  # [B, Hm, Wm]
-        # resize to GT size (our eval size)
-        rba_map = F.interpolate(
-            rba_map.unsqueeze(1),
-            size=(512, 1024),
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(1)
-        anomaly_result = rba_map.squeeze(0).cpu()  # [H, W]
-    # Standard methods (MSP, MaxL, MaxE) work on in-distribution    channels
-    elif method == "MSP":
-        anomaly_result = (1.0 - sem_probs_id.max(dim=1).values).squeeze().cpu()
-    elif method == "MaxL":
-        pixel_logits = torch.einsum(
-            "bqk, bqhw -> bkhw", class_logits[:, :, :-1], mask_probs
-        )
-        pixel_logits = F.interpolate(
-            pixel_logits,
-            size=(512, 1024),
-            mode="bilinear",
-            align_corners=False,
-        )
-        anomaly_result = (-pixel_logits.max(dim=1).values).squeeze().cpu()
-    elif method == "MaxE":
-        # Shannon Entropy
-        anomaly_result = (
-            (-(sem_probs_id * torch.log(sem_probs_id + 1e-12)).sum(dim=1))
-            .squeeze()
-            .cpu()
-        )
+        pe_key = "encoder.backbone.pos_embed"
+        if pe_key in clean_state:
+            model_sd = model.state_dict()
+            if pe_key in model_sd:
+                ckpt_shape = clean_state[pe_key].shape
+                model_shape = model_sd[pe_key].shape
+                if ckpt_shape != model_shape:
+                    print(
+                        f"Resizing pos_embed: ckpt {ckpt_shape} -> model {model_shape}"
+                    )
+                    try:
+                        patch_size = model.encoder.backbone.patch_embed.patch_size
+                        if isinstance(patch_size, int):
+                            patch_size = (patch_size, patch_size)
+                    except AttributeError:
+                        patch_size = (16, 16)
+                    target_h_grid = img_size_tuple[0] // patch_size[0]
+                    target_w_grid = img_size_tuple[1] // patch_size[1]
+                    clean_state[pe_key] = resize_pos_embed_rectangular(
+                        clean_state[pe_key], (target_h_grid, target_w_grid)
+                    )
 
-    preds = (anomaly_result > threshold).long()
+        model.load_state_dict(clean_state, strict=False)
+        print("Weights Loaded.")
+    else:
+        print("WARNING: Random initialization used!")
 
-    if preds.dim() == 2:
-        preds = preds.unsqueeze(0).unsqueeze(0)
-    elif preds.dim() == 3:
-        preds = preds.unsqueeze(1)
-
-    return preds
+    model.to(device)
+    model.eval()
+    return model
 
 
-def main(args):
-    device = torch.device("cpu" if args.cpu else "cuda")
+def semantic_inference(model, image_tensor):
+    with torch.no_grad():
+        outputs = model(image_tensor)
 
-    # Load config file & build model
-    cfg_path = os.path.normpath(os.path.join(project_root, args.eomt_config))
-    if not os.path.exists(cfg_path):
-        print(f"Error: Config file not found at {cfg_path}")
-        return
+    if (
+        isinstance(outputs, (list, tuple))
+        and len(outputs) == 1
+        and isinstance(outputs[0], (list, tuple))
+    ):
+        outputs = outputs[0]
+    if not isinstance(outputs, (list, tuple)) or len(outputs) != 2:
+        if hasattr(model, "network"):
+            outputs = model.network(image_tensor)
 
-    cfg = OmegaConf.load(cfg_path)
-
-    data_args = cfg.get("data", {}).get("init_args", {})
-    img_size_cfg = data_args.get("img_size", 640)
-    num_classes = data_args.get("num_classes", 19)
-    img_size_vit = (
-        (img_size_cfg, img_size_cfg)
-        if isinstance(img_size_cfg, int)
-        else tuple(img_size_cfg)
-    )
-
-    net_node = OmegaConf.to_container(
-        cfg["model"]["init_args"]["network"], resolve=True
-    )
-    inject_cfg_values(net_node, img_size_vit, num_classes)
-
-    print("Instantiating model architecture...")
-    model = instantiate_from_cfg(net_node)
-
-    ckpt_path = os.path.normpath(os.path.join(project_root, args.eomt_ckpt))
-    if not os.path.exists(ckpt_path):
-        print(f"Error: Checkpoint not found at {ckpt_path}")
-        return
-
-    # Load weights
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    state = ckpt.get("state_dict", ckpt.get("model", ckpt))
-
-    def strip_prefix(k):
-        for p in ("model.network.", "network.", "model.", "module."):
-            if k.startswith(p):
-                return k[len(p) :]
-        return k
-
-    clean_state = {strip_prefix(k): v for k, v in state.items()}
-    model_sd = model.state_dict()
-    pe_key = "encoder.backbone.pos_embed"
-    if pe_key in clean_state and pe_key in model_sd:
-        if clean_state[pe_key].shape != model_sd[pe_key].shape:
-            clean_state[pe_key] = resize_pos_embed_path_only(
-                clean_state[pe_key], model_sd[pe_key].shape[1]
-            )
-
-    model.load_state_dict(clean_state, strict=False)
-    model.to(device).eval()
-
-    input_transform = Compose([Resize(img_size_vit, Image.BILINEAR), ToTensor()])
-    target_transform = Compose([Resize((512, 1024), Image.NEAREST), ToLabel()])
-
-    dataset = Anomaly(args.datadir, input_transform, target_transform)
-    loader = DataLoader(
-        dataset, num_workers=args.num_workers, batch_size=args.batch_size, shuffle=False
-    )
-
-    iouEvalVal = iouEval(2)
-    start = time.time()
-
-    print(
-        f"Starting IoU Evaluation with method: {args.method} (Threshold: {args.threshold})"
-    )
-
-    for step, (images, labels, filename, filenameGt) in enumerate(loader):
-        images, labels = images.to(device), labels.to(device)
-
-        with torch.no_grad():
-            mask_logits_layers, class_logits_layers = model(images)
-            mask_logits = mask_logits_layers[-1]
-            class_logits = class_logits_layers[-1]
-
-        # Get binary predictions
-        binary_predictions = get_anomaly_prediction(
-            mask_logits, class_logits, args.method, args.threshold, args.tempScale
-        )
-
-        # Ground_Truth remapping
-        labels_np = labels.cpu()
-        pathGT = filenameGt[0]
-
-        # RA: Unique labels: [0, 1, 2]  --> Remap 2 to 1
-        # RA21, RO21, FS_LF, FS_Static: Unique labels: [0,1,255]  --> Remap 255 to 1
-        if "RoadAnomaly" in pathGT:
-            labels_binary = np.where((labels_np == 2), 1, 0)
-        elif "RoadObsticle21" in pathGT or "RoadAnomaly21" in pathGT:
-            labels_binary = np.where((labels_np == 255), 1, 0)
-        elif "FS_LostFound_full" in pathGT or "fs_static" in pathGT:
-            labels_binary = np.where((labels_np == 255), 1, 0)
-        else:
-            labels_binary = np.where(labels_np > 0, 1, 0)
-
-        labels_tensor = torch.from_numpy(labels_binary).long().to(device)
-        if labels_tensor.dim() == 3:
-            labels_tensor = labels_tensor.unsqueeze(1)
-
-        iouEvalVal.addBatch(binary_predictions, labels_tensor)
-        if (step + 1) % 5 == 0:
-            print(f"[{step+1}/{len(loader)}] {os.path.basename(filename[0])}")
-
-    iouVal, iou_classes = iouEvalVal.getIoU()
-
-    iou_classes_str = []
-    for i in range(iou_classes.size(0)):
-        val = iou_classes[i].item()
-        iouStr = getColorEntry(val) + "{:0.2f}".format(val * 100) + "\033[0m"
-        iou_classes_str.append(iouStr)
-
-    print("---------------------------------------")
-    print(f"Results for Method: {args.method} (Threshold: {args.threshold})")
-    print("Took ", time.time() - start, "seconds")
-    print("=======================================")
-    print("Per-Class IoU:")
-    print(iou_classes_str[0], "Normal (In-Distribution)")
-    print(iou_classes_str[1], "Anomaly (Out-of-Distribution)")
-    print("=======================================")
-    mIoU_val = iouVal.item()
-    iouStr = getColorEntry(mIoU_val) + "{:0.2f}".format(mIoU_val * 100) + "\033[0m"
-    print("MEAN IoU: ", iouStr, "%")
+    mask_logits_list, class_logits_list = outputs
+    mask_logits = mask_logits_list[-1]
+    class_logits = class_logits_list[-1]
+    return mask_logits, class_logits
 
 
-if __name__ == "__main__":
+def main():
     parser = ArgumentParser()
-
-    parser.add_argument("--state")
+    parser.add_argument(
+        "--input", required=True, help="Root directory containing datasets"
+    )
+    parser.add_argument(
+        "--dataset", default="RaoadAnomaly21", choices=DATASET_CONFIGS.keys()
+    )
+    parser.add_argument("--config", default="eomt_base_640.yaml")
+    parser.add_argument("--ckpt", default=None)
+    parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--img_height", type=int, default=640)
+    parser.add_argument("--img_width", type=int, default=1280)
     parser.add_argument(
         "--method",
-        type=str,
         default="MSP",
-        choices=["MSP", "MaxL", "MaxE", "RbA", "MSP-T"],
-        help="Anomaly scoring method (MSP, MaxL, MaxE, RbA, or MSP-T)",
-    )  # Method argument to decide the post-hoc method
+        choices=["MSP", "MSP-T", "MaxLogit", "MaxEntropy", "RbA"],
+    )
+
+    # Threshold used to binarize the score distribution.
     parser.add_argument(
         "--threshold",
         type=float,
         default=0.5,
-        help="Threshold used to convert continuous score to binary prediction (0 or 1)",
-    )
-    parser.add_argument(
-        "--eomt_config",
-        default="eomt/configs/dinov2/cityscapes/semantic/eomt_base_640.yaml",
-    )  # Relative path to config file
-    parser.add_argument(
-        "--eomt_ckpt",
-        default=r"C:\Users\karee\Desktop\Anomaly-Project\MaskArchitectureAnomaly_CourseProject\eomt_checkpoints\eomt_cityscapes.bin",
-    )  # Relative path to pretrained model
-    parser.add_argument(
-        "--loadDir",
-        default=r"C:\Users\karee\Desktop\Anomaly-Project\MaskArchitectureAnomaly_CourseProject",
-    )
-    parser.add_argument("--subset", default="val")
-    parser.add_argument(
-        "--datadir",
-        default=r"C:\Users\karee\Desktop\Anomaly-Project\MaskArchitectureAnomaly_CourseProject\Validation_Dataset\RoadAnomaly21",
+        help="Threshold to binarize anomaly score",
     )
     parser.add_argument(
         "--tempScale",
         type=float,
         default=0.5,
-        help="Temperature scaling factor for MSP-T metohd",
-    )  # Temperature scale argument to decide post-processing in MSP-T
-    parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--cpu", action="store_true")
+    )
 
-    main(parser.parse_args())
+    args = parser.parse_args()
+    device = torch.device("cpu" if args.cpu else "cuda")
+    ds_cfg = DATASET_CONFIGS[args.dataset]
+
+    image_dir = os.path.join(args.input, ds_cfg["img_folder"])
+    if (
+        not os.path.exists(image_dir)
+        and os.path.basename(os.path.normpath(args.input)) == ds_cfg["img_folder"]
+    ):
+        image_dir = args.input
+        args.input = os.path.dirname(args.input)
+
+    print(f"Scanning images in: {image_dir}")
+    images = sorted(
+        glob.glob(os.path.join(image_dir, "**", f"*{ds_cfg['suffix']}"), recursive=True)
+    )
+    if not images:
+        images = sorted(
+            glob.glob(os.path.join(image_dir, "**", "*.png"), recursive=True)
+        )
+    print(f"Found {len(images)} images.")
+
+    img_size_tuple = (args.img_height, args.img_width)
+    try:
+        model = load_eomt_model(args.config, args.ckpt, device, img_size_tuple)
+    except Exception as e:
+        print(f"Critical Error loading model: {e}")
+        return
+
+    input_transform = Compose(
+        [
+            Resize(img_size_tuple, Image.BILINEAR),
+            ToTensor(),
+        ]
+    )
+
+    if args.dataset in ["RoadAnomaly21", "RoadObsticle21"]:
+        iouEvalVal = iouEval(nClasses=3, ignoreIndex=2)
+    else:
+        iouEvalVal = iouEval(nClasses=2)
+
+    start = time.time()
+
+    for i, path in enumerate(images):
+        if i % 10 == 0:
+            print(f"Processing {i}/{len(images)}: {os.path.basename(path)}")
+
+        try:
+            image = Image.open(path).convert("RGB")
+            orig_w, orig_h = image.size
+            if ds_cfg.get("eval_resize"):
+                EVAL_H, EVAL_W = ds_cfg["eval_resize"]
+            else:
+                EVAL_H, EVAL_W = orig_h, orig_w
+
+            image_tensor = input_transform(image).unsqueeze(0).to(device)
+
+            mask_logits, class_logits = semantic_inference(model, image_tensor)
+
+            if args.method == "RbA":
+                mask_probs = mask_logits.sigmoid()
+
+                class_probs_all = F.softmax(class_logits, dim=-1)
+
+                inlier_probs = class_probs_all[..., :-1]
+
+                rej_q = 1.0 - inlier_probs.max(dim=-1).values
+
+                rba_map = torch.einsum("bq,bqhw->bhw", rej_q, mask_probs)
+
+                rba_map = rba_map / (mask_probs.sum(dim=1) + 1.0)
+
+                rba_map = F.interpolate(
+                    rba_map.unsqueeze(1),
+                    size=(EVAL_H, EVAL_W),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(1)
+                anomaly_map = rba_map.squeeze(0).cpu().numpy()
+
+            elif args.method == "MaxLogit":
+                mask_probs = mask_logits.sigmoid()
+
+                class_term = class_logits[..., :-1]
+
+                pixel_logits = torch.einsum("bqk, bqhw -> bkhw", class_term, mask_probs)
+
+                pixel_logits = F.interpolate(
+                    pixel_logits,
+                    size=(EVAL_H, EVAL_W),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+                anomaly_map = (-pixel_logits.max(dim=1).values).squeeze().cpu().numpy()
+
+            else:
+                mask_probs = mask_logits.sigmoid()
+
+                if args.method == "MSP-T":
+                    t = (torch.ones(1) * args.tempScale).to(device)
+                    class_probs = F.softmax(class_logits / t, dim=-1)[..., :-1]
+                else:
+
+                    class_probs = F.softmax(class_logits, dim=-1)[..., :-1]
+
+                sem_map = torch.einsum("bqk, bqhw -> bkhw", class_probs, mask_probs)
+
+                sem_map = sem_map / (sem_map.sum(dim=1, keepdim=True) + 1e-6)
+
+                sem_map = F.interpolate(
+                    sem_map,
+                    size=(EVAL_H, EVAL_W),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+                if args.method in ["MSP", "MSP-T"]:
+                    anomaly_map = (
+                        (1.0 - sem_map.max(dim=1).values).squeeze().cpu().numpy()
+                    )
+
+                elif args.method == "MaxEntropy":
+                    log_probs = torch.log(sem_map + 1e-12)
+                    entropy = -(sem_map * log_probs).sum(dim=1)
+                    max_ent = math.log(sem_map.shape[1])
+                    anomaly_map = (entropy / max_ent).squeeze().cpu().numpy()
+
+            filename = os.path.basename(path)
+            gt_path = os.path.join(args.input, ds_cfg["target_folder"], filename)
+
+            if not os.path.exists(gt_path):
+                gt_path = gt_path.replace(ds_cfg["suffix"], ".png")
+            if not os.path.exists(gt_path) and filename.endswith(".jpg"):
+                gt_path = gt_path.replace(".jpg", ".png")
+            if not os.path.exists(gt_path) and ds_cfg["suffix"] == ".webp":
+                gt_path = gt_path.replace(".png", ".webp")
+
+            if os.path.exists(gt_path):
+                gt_img = Image.open(gt_path)
+                if gt_img.size != (EVAL_W, EVAL_H):
+                    gt_img = gt_img.resize((EVAL_W, EVAL_H), Image.NEAREST)
+                gt_np = np.array(gt_img)
+
+                if "RoadAnomaly" in args.dataset:
+                    gt_np = np.where(gt_np == 2, 1, gt_np)
+                if "FS_LostFound_full" in args.dataset or "fs_static" in args.dataset:
+                    gt_np = np.where(gt_np == 255, 1, gt_np)
+                if "RoadAnomaly21" in args.dataset or "RoadObsticle21" in args.dataset:
+                    gt_np = np.where(gt_np == 255, 2, gt_np)
+
+                binary_gt = gt_np.astype(np.uint8)
+
+                if args.method in ["MaxLogit", "RbA", "MaxEntropy"]:
+                    min_v, max_v = anomaly_map.min(), anomaly_map.max()
+                    if max_v != min_v:
+                        anomaly_map = (anomaly_map - min_v) / (max_v - min_v)
+                pred_mask = (anomaly_map > args.threshold).astype(np.uint8)
+
+                pred_tensor = (
+                    torch.from_numpy(pred_mask)
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                    .long()
+                    .to(device)
+                )
+                gt_tensor = (
+                    torch.from_numpy(binary_gt)
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                    .long()
+                    .to(device)
+                )
+
+                iouEvalVal.addBatch(pred_tensor, gt_tensor)
+
+            else:
+                print(f"Warning: GT not found for {filename}")
+
+        except Exception as e:
+            print(f"Error processing {path}: {e}")
+            continue
+
+    iouVal, iou_classes = iouEvalVal.getIoU()
+
+    iou_classes_str = []
+    for i in range(iou_classes.size(0)):
+        iouStr = (
+            getColorEntry(iou_classes[i])
+            + "{:0.2f}".format(iou_classes[i] * 100)
+            + "\033[0m"
+        )
+        iou_classes_str.append(iouStr)
+
+    print("---------------------------------------")
+    print("Took ", time.time() - start, "seconds")
+    print("=======================================")
+    print(f"Dataset: {args.dataset}")
+    print(f"Method: {args.method} (Threshold: {args.threshold})")
+    print("Per-Class IoU:")
+    print(iou_classes_str[0], "Normal/Background")
+    print(iou_classes_str[1], "Anomaly")
+    print("=======================================")
+    iouStr = getColorEntry(iouVal) + "{:0.2f}".format(iouVal * 100) + "\033[0m"
+    print("MEAN IoU: ", iouStr, "%")
+
+
+if __name__ == "__main__":
+    main()
