@@ -8,6 +8,7 @@ from PIL import Image
 import numpy as np
 from erfnet import ERFNet
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 import os.path as osp
 from argparse import ArgumentParser
 from ood_metrics import fpr_at_95_tpr, calc_metrics, plot_roc, plot_pr, plot_barcode
@@ -88,11 +89,12 @@ def visualize_result(
         ax1.set_title("Original Image")
         ax1.axis("off")
 
-        gt_mask_display = gt_mask.copy()  # Ground-Truth mask
-        ax2 = plt.subplot(1, 3, 2)
-        ax2.imshow(gt_mask_display, cmap="binary")
-        ax2.set_title("Ground Truth Anomaly (1=Anomaly)")
-        ax2.axis("off")
+        plt.subplot(1, 3, 2)
+        if gt_mask is not None:
+            gt_mask = np.where(gt_mask == 255, 0, gt_mask)
+            plt.imshow(gt_mask, cmap=cm.get_cmap("binary").reversed())
+        plt.title("Ground Truth")
+        plt.axis("off")
 
         ax3 = plt.subplot(1, 3, 3)
 
@@ -281,15 +283,20 @@ def main():
         # RA: Unique labels: [0, 1, 2]  --> Remap 2 to 1
         # RA21, RO21, FS_LF, FS_Static: Unique labels: [0,1,255]  --> Remap 255 to 1
         if "RoadAnomaly" in pathGT:
-            ood_gts = np.where((ood_gts == 2), 1, ood_gts)
-        if "RoadObsticle21" in pathGT or "RoadAnomaly21" in pathGT:
-            ood_gts = np.where((ood_gts == 255), 1, ood_gts)
+            ood_gts = np.where(ood_gts == 2, 1, ood_gts)
         if "FS_LostFound_full" in pathGT or "fs_static" in pathGT:
-            ood_gts = np.where((ood_gts == 255), 1, ood_gts)
+            ood_gts = np.where(ood_gts == 255, 1, ood_gts)
+
+        # ood_gts = ood_gts.astype(np.uint8)
 
         if 1 not in np.unique(ood_gts):
             continue
+
         else:
+            if args.method in ["MaxL", "RbA", "MaxE"]:
+                min_v, max_v = anomaly_result.min(), anomaly_result.max()
+                if max_v != min_v:
+                    anomaly_result = (anomaly_result - min_v) / (max_v - min_v)
             ood_gts_list.append(ood_gts)
             anomaly_score_list.append(anomaly_result)
             base_filename = os.path.basename(path).split(".")[0]
@@ -324,6 +331,9 @@ def main():
 
     val_out = np.concatenate((ind_out, ood_out))
     val_label = np.concatenate((ind_label, ood_label))
+    valid_mask = val_label != 255
+    val_out = val_out[valid_mask]
+    val_label = val_label[valid_mask]
     print("val_label size: ", len(val_label))
     print("val_out size: ", len(val_out))
     print("unique labels: ", np.unique(val_label))
