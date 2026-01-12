@@ -320,17 +320,8 @@ def main():
     ood_gts = np.array(ood_gts_list)
     anomaly_scores = np.array(anomaly_score_list)
 
-    ood_mask = ood_gts == 1
-    ind_mask = ood_gts == 0
-
-    ood_out = anomaly_scores[ood_mask]
-    ind_out = anomaly_scores[ind_mask]
-
-    ood_label = np.ones(len(ood_out))
-    ind_label = np.zeros(len(ind_out))
-
-    val_out = np.concatenate((ind_out, ood_out))
-    val_label = np.concatenate((ind_label, ood_label))
+    val_out = np.concatenate(anomaly_scores)
+    val_label = np.concatenate(ood_gts)
     valid_mask = val_label != 255
     val_out = val_out[valid_mask]
     val_label = val_label[valid_mask]

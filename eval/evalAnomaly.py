@@ -140,8 +140,6 @@ def main():
         mask = target_transform(mask)
         ood_gts = np.array(mask)
 
-        if "RoadAnomaly21" in pathGT:
-            ood_gts = np.where((ood_gts == 255), 1, ood_gts)
         if "RoadAnomaly" in pathGT:
             ood_gts = np.where((ood_gts == 2), 1, ood_gts)
         if "LostAndFound" in pathGT:

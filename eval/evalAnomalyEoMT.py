@@ -528,7 +528,7 @@ def main():
             if 1 not in np.unique(binary_gt):
                 continue
 
-            if args.method in ["MaxLogit", "RbA", "MaxEntropy", "MSP", "MSP-T"]:
+            if args.method in ["MaxLogit", "RbA", "MaxEntropy"]:
                 min_v, max_v = anomaly_map.min(), anomaly_map.max()
                 if max_v != min_v:
                     anomaly_map = (anomaly_map - min_v) / (max_v - min_v)
@@ -573,7 +573,6 @@ def main():
 
         fpr = fpr_at_95_tpr(all_scores, all_gts)
 
-        fpr = fpr_at_95_tpr(all_scores, all_gts)
         auprc = average_precision_score(all_gts, all_scores)
 
         print(f"Method: {args.method}")
