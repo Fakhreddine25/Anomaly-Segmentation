@@ -51,25 +51,23 @@ This code evaluates the ERFNet over our desired datasets. It is able to produce 
 This code evaluates the EoMT over our desired datasets. It is able to produce the following metrics: AuPRC - FPR@95 - mIoU. The code takes several arguments as inputs in order to function properly as intended.
 
 **Examples:**
-```
-!python eval/evalAnomalyEoMT.py --input "path/to/dataset/images/*.png" --method "RbA" --eomt_config "path/to/the/relative/config/file" --eomt_ckpt "path/to/the/saved/pre-trained/weights"  --datadir "path/to/the/dataset/folder"
-```
+
+!python eval/evalAnomalyEoMT.py --input "path/to/datasets/FS_LostFound_full" --dataset FS_LostFound_full --config "path/to/config/file" --ckpt "path/to/ckpt/file" --method MSP-T 
 
 **Arguments:**
 - ```--input```: Path to the first image within the chosen dataset with the image name indicated by '*' + .png (or the specific image extension).
 - ```--method```: A str that indicates the post-hoc method to be used. Options are: [MSP, MaxL, MaxE, MSP-T, and RbA].
-- ```--eomt_config```: A path to the configs file for the proper functioning of the EoMT model (make sure to download dependencies beforehand).
-- ```--eomt_ckpt```: A path to the pre-trained weights of the EoMT model (download them [**here**](https://drive.google.com/file/d/1zcayoIIJztxKuHOIjmSjGoQBDy4RdETr/view))
-- ```--datadir```: Path to the chosen dataset's folder which should include two folders: Images and Labels Masks.
+- ```--config```: A path to the configs file for the proper functioning of the EoMT model (make sure to download dependencies beforehand).
+- ```--ckpt```: A path to the pre-trained weights of the EoMT model (download them [**here**](https://drive.google.com/file/d/1zcayoIIJztxKuHOIjmSjGoQBDy4RdETr/view))
+- ```--dataset```: Dataset name to be passed for DATASET_CONFIGS.
 
 **Additional arguments (optional):**
-- ```--save\_logits```: If used, saves the logits of the outputs in the case of "MSP".
 - ```--tempScale```: Decides the value of temperature in order to perform Temperature Scaling, used with "MSP-T".
-- ```--logits\_dir```: This is the directory to save the logits in or could be used to load previously saved logits.
+- ```--save```: If toggled, saves visual results of segmentation in root directory. 
 
 **Example of complete command:**
 ```
-!python eval/evalAnomalyEoMT.py --input "path/to/dataset/images/*.png" --method "RbA" --eomt_config "path/to/the/relative/config/file" --eomt_ckpt "path/to/the/saved/pre-trained/weights"  --datadir "path/to/the/dataset/folder" --save_logits --tempScale 0.75 --logits_dir "path/to/save/or/load/logits/in"
+!python eval/evalAnomalyEoMT.py --input "path/to/datasets/FS_LostFound_full" --dataset FS_LostFound_full --config "path/to/config/file" --ckpt "path/to/ckpt/file" --save --method MSP-T --tempScale 1.1
 ```
 
 
@@ -102,11 +100,13 @@ This code evaluates the IoU (per-class and mIoU) on the EoMT model. The code bin
 
 **Examples:**
 ```
-!python eval/eval_iouEoMT.py --datadir "path/to/the/dataset/folder" --method "RbA" --threshold 0.6
+!python eval/eval_iouEoMT.py --input "path/to/datasets/FS_LostFound_full" --dataset FS_LostFound_full --config "path/to/config/file" --ckpt "path/to/ckpt/file" --method MSP --threshold 0.5 
 ```
 
 **Arguments:**
-- ```--datadir```: Path to the chosen dataset's folder which should include two folders: Images and Labels Masks.
+- ```--input```: Path to dataset.
+- ```--dataset```: Dataset name to be passed for DATASET_CONFIGS.
+- ```--config```: A path to the configs file for the proper functioning of the EoMT model (make sure to download dependencies beforehand). 
 - ```--method```: A str that indicates the post-hoc method to be used. Options are: [MSP, MaxL, MaxE, MSP-T, and RbA].
 - ```--threshold```: A constant needed to define the threshold score for the criteria of binarization.
 
@@ -115,10 +115,11 @@ This code evaluates the IoU (per-class and mIoU) on the EoMT model. The code bin
 
 **Example of complete command:**
 ```
-!python eval/eval_iouEoMT.py --datadir "path/to/the/dataset/folder" --method "MSP-T" --threshold 0.6 --tempScale 0.5
+!python eval/eval_iouEoMT.py --input "path/to/datasets/FS_LostFound_full" --dataset FS_LostFound_full --config "path/to/config/file" --ckpt "path/to/ckpt/file" --method MSP-T --threshold 0.5 --tempScale
 ```
 
 # For complete ready commands refer to the commands file .ipynb: [**Commands-CourseProject**](https://github.com/Fakhreddine25/Anomaly-Segmentation/blob/main/Commands-CourseProject.ipynb)
+
 
 
 
